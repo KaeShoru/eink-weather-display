@@ -1,0 +1,58 @@
+# ESPHome E-Ink Weather Display - Git Ignore File
+
+# Compiled binaries
+*.bin
+*.elf
+*.map
+*.pio
+
+# ESPHome build files
+.pioenvs
+.piolibdeps
+.clang_complete
+.gcc-flags.json
+
+# Secrets (never commit these!)
+secrets.yaml
+.secrets
+*.secret
+
+# IDE specific files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS specific files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# Backup files
+*.bak
+*~
+*.orig
+
+# User-specific configuration
+config.user.yaml
+my-config.yaml
+
+# Font files (if using local fonts instead of gfonts)
+fonts/*.ttf
+fonts/*.otf
+!fonts/.gitkeep
+
+# Images (add your own display photos)
+# Note: display-photo.jpg is intentionally not ignored
+images/*.png
+!images/.gitkeep
+
+# Documentation builds
+docs/_build/
+docs/.doctrees/

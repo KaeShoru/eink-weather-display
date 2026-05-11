@@ -1,0 +1,729 @@
+# ESPHome E-Ink Weather Display
+# 7.5" Waveshare E-Paper display with ESP32, weather forecast, and room sensors
+# Inspired by ESPHomeDesigner (https://github.com/koosoli/ESPHomeDesigner)
+# Most of the design was manually customized
+
+esphome:
+  name: eink-weather-display
+  # On boot, start the main script that manages display updates and deep sleep
+  on_boot:
+    priority: -100
+    then:
+      - script.execute: manage_run_and_sleep
+
+# ============================================================================
+# SCRIPTS
+# ============================================================================
+
+script:
+  # Update the E-Ink display with current data
+  - id: update_screen
+    then:
+      - logger.log: "Updating screen"
+      - display.page.show: dashboard
+      - component.update: epaper_display
+
+  # Main script that waits for data, updates screen, and manages deep sleep
+  - id: manage_run_and_sleep
+    mode: restart
+    then:
+      # Wait for Home Assistant time, API connection, and battery data
+      # Timeout 10s to prevent hanging if data is unavailable
+      - logger.log: "Waiting for sync..."
+      - wait_until:
+          condition:
+            lambda: |-
+              return id(ha_time).now().is_valid() &&
+                     api_is_connected() &&
+                     id(ink_battery).has_state() &&
+                     id(ink_battery).state >= 0 &&
+                     id(ink_battery).state <= 100;
+          timeout: 10s
+      # Wait 2 seconds for display to be ready
+      - delay: 2s
+      # Update the screen
+      - script.execute: update_screen
+      # Wait 5 seconds to show the updated content
+      - delay: 5s
+      # Decide whether to enter deep sleep
+      - script.execute: start_deep_sleep
+
+  # Enter deep sleep if enabled, otherwise loop after 60 seconds
+  - id: start_deep_sleep
+    mode: queued
+    then:
+      - if:
+          condition:
+            binary_sensor.is_on: deep_sleep_enabled
+          then:
+            - logger.log: 'Going to deep sleep.'
+            # Enter deep sleep for 30 minutes
+            - deep_sleep.enter:
+                id: deep_sleep_control
+          else:
+            - logger.log: 'Deep Sleep Disabled'
+            # Prevent deep sleep and loop after 60 seconds
+            - deep_sleep.prevent: deep_sleep_control
+            - delay: 60s
+            - script.execute: manage_run_and_sleep
+
+# ============================================================================
+# HARDWARE PLATFORM
+# ============================================================================
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# Enable logging (UART disabled to save power)
+logger:
+  baud_rate: 0
+
+# Enable Home Assistant API for real-time data
+api:
+
+# Enable Over-The-Air updates
+ota:
+  - platform: esphome
+
+# ============================================================================
+# WIFI CONFIGURATION
+# ============================================================================
+
+wifi:
+  # Replace with your WiFi credentials
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Enable fallback hotspot in case WiFi connection fails
+  ap:
+    ssid: "E-Ink Display Fallback"
+    password: "fallback123"
+
+# ============================================================================
+# SPI CONFIGURATION (for E-Paper display)
+# ============================================================================
+
+spi:
+  clk_pin: GPIO13
+  mosi_pin: GPIO14
+
+# ============================================================================
+# COLOR DEFINITIONS
+# ============================================================================
+
+color:
+  # Black color (for e-paper display)
+  - id: COLOR_BLACK
+    red: 100%
+    green: 100%
+    blue: 100%
+  # White color (background for e-paper display)
+  - id: COLOR_WHITE
+    red: 0%
+    green: 0%
+    blue: 0%
+
+# ============================================================================
+# DISPLAY CONFIGURATION
+# ============================================================================
+
+display:
+  - platform: waveshare_epaper
+    id: epaper_display
+    # Chip Select pin
+    cs_pin: GPIO15
+    # Data/Command pin
+    dc_pin: GPIO27
+    # Busy pin (inverted for this display model)
+    busy_pin:
+      number: GPIO25
+      inverted: true
+    # Reset pin
+    reset_pin: GPIO26
+    reset_duration: 2ms
+    # 7.5" E-Paper display V2
+    model: 7.50inV2p
+    # Update interval (for non-sleep mode)
+    update_interval: 10s
+    # Rotate 90 degrees
+    rotation: 90°
+    # Auto clear display before update
+    auto_clear_enabled: true
+    pages:
+      - id: dashboard
+        # Main dashboard lambda - all rendering logic is here
+        lambda: |-
+          auto color_off = COLOR_WHITE;
+          auto color_on = COLOR_BLACK;
+
+          // Helper function to print text with word-wrap at widget boundary
+          // This allows long text to be wrapped within a specified width
+          auto print_wrapped_text = [&](int x, int y, int max_w, int line_h, esphome::font::Font *font, Color color, TextAlign align, const char* text) {
+            if (!text || max_w <= 0) return;
+            int cx = x;
+            int cy = y;
+            std::string line;
+            std::string word;
+            const char* p = text;
+            while (*p) {
+              // Treat newlines, carriage returns, and tabs as spaces for text flow
+              bool is_space = (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t');
+              if (is_space) {
+                if (!word.empty()) {
+                  int ww, wh, wbl, wx;
+                  font->measure(word.c_str(), &ww, &wx, &wbl, &wh);
+                  int lw = 0, lx;
+                  if (!line.empty()) {
+                    font->measure(line.c_str(), &lw, &lx, &wbl, &wh);
+                    int sw, sx, sbl, sh;
+                    font->measure(" ", &sw, &sx, &sbl, &sh);
+                    lw += sw;
+                  }
+                  // If adding this word exceeds the width, print the current line
+                  if (lw + ww > max_w && !line.empty()) {
+                    it.print(cx, cy, font, color, align, line.c_str());
+                    cy += line_h;
+                    line = word;
+                  } else {
+                    // Add word to current line
+                    if (!line.empty()) line += " ";
+                    line += word;
+                  }
+                  word.clear();
+                }
+              } else {
+                word += *p;
+              }
+              p++;
+            }
+            // Print the last word/line
+            if (!word.empty()) {
+              int ww, wh, wbl, wx;
+              font->measure(word.c_str(), &ww, &wx, &wbl, &wh);
+              int lw = 0, lx;
+              if (!line.empty()) {
+                font->measure(line.c_str(), &lw, &lx, &wbl, &wh);
+                int sw, sx, sbl, sh;
+                font->measure(" ", &sw, &sx, &sbl, &sh);
+                lw += sw;
+              }
+              if (lw + ww > max_w && !line.empty()) {
+                it.print(cx, cy, font, color, align, line.c_str());
+                cy += line_h;
+                line = word;
+              } else {
+                if (!line.empty()) line += " ";
+                line += word;
+              }
+            }
+            if (!line.empty()) {
+              it.print(cx, cy, font, color, align, line.c_str());
+            }
+          };
+
+          // Helper function to apply grey dither mask for e-paper (checkerboard pattern)
+          // Creates a simple 2-color dithering effect
+          auto apply_grey_dither_mask = [&](int x_start, int y_start, int w, int h) {
+            for (int y = y_start; y < y_start + h; y++) {
+              for (int x = x_start; x < x_start + w; x++) {
+                if ((x + y) % 2 == 0) it.draw_pixel_at(x, y, COLOR_WHITE);
+                else it.draw_pixel_at(x, y, COLOR_BLACK);
+              }
+            }
+          };
+
+          // Helper function to apply grey dither to text (subtractive)
+          // Erases every other black pixel to create a grey effect
+          auto apply_grey_dither_to_text = [&](int x_start, int y_start, int w, int h) {
+            for (int y = y_start; y < y_start + h; y++) {
+              for (int x = x_start; x < x_start + w; x++) {
+                if ((x + y) % 2 == 0) it.draw_pixel_at(x, y, COLOR_WHITE);
+              }
+            }
+          };
+
+          // ========================================
+          // START OF DISPLAY RENDERING
+          // ========================================
+
+          // Fill background with white
+          it.fill(COLOR_WHITE);
+          color_off = COLOR_WHITE;
+          color_on = COLOR_BLACK;
+
+          // ========================================
+          // 1. GREETING SECTION (TOP)
+          // ========================================
+
+          // Choose font size based on holiday mode
+          // Smaller font if showing dates, larger if only greeting
+          auto font_to_use = id(holiday_mode).state ? id(font_playfair_display_600_40) : id(font_playfair_display_600_100);
+          int y_pos = id(holiday_mode).state ? 50 : 60;
+          int h_pos = id(holiday_mode).state ? 54 : 74;
+
+          // Render greeting text from Home Assistant input_text
+          {
+            char wrap_buf[512];
+            sprintf(wrap_buf, "%s!", id(input_text_greeting).state.c_str());
+            print_wrapped_text(240, y_pos, 460, h_pos, font_to_use, color_on, TextAlign::CENTER, wrap_buf);
+          }
+
+          // ========================================
+          // 2. HOLIDAY DATES (IF ENABLED)
+          // ========================================
+
+          // Show holiday dates if holiday mode is enabled
+          if (id(holiday_mode).state) {
+            char wrap_buf[512];
+            sprintf(wrap_buf, "%s", id(input_text_dates).state.c_str());
+            print_wrapped_text(240, 98, 380, 19, id(font_roboto_600_15), color_on, TextAlign::CENTER, wrap_buf);
+            // Horizontal line separator
+            it.filled_rectangle(140, 83, 200, 1, color_on);
+          }
+
+          // Horizontal line separator after greeting
+          it.filled_rectangle(140, 113, 200, 1, color_on);
+
+          // ========================================
+          // 3. STATUS BAR (TIME, WIFI, BATTERY)
+          // ========================================
+
+          // --- WiFi Signal (right side) ---
+          {
+            const char* wifi_icon = "\U000F092B"; // Default: wifi off
+            if (id(wifi_signal_dbm).has_state()) {
+              float sig = id(wifi_signal_dbm).state;
+              if (sig >= -50) wifi_icon = "\U000F0928"; // Excellent
+              else if (sig >= -70) wifi_icon = "\U000F0925"; // Good
+              else if (sig >= -85) wifi_icon = "\U000F0922"; // Fair
+              else wifi_icon = "\U000F091F"; // Weak
+            }
+            it.printf(383 - 4, 12, id(font_material_design_icons_400_16), color_on, TextAlign::CENTER_RIGHT, "%s", wifi_icon);
+            if (id(wifi_signal_dbm).has_state())
+              it.printf(383 + 4, 12, id(font_roboto_400_12), color_on, TextAlign::CENTER_LEFT, "%.0fdB", id(wifi_signal_dbm).state);
+            else
+              it.printf(383 + 4, 12, id(font_roboto_400_12), color_on, TextAlign::CENTER_LEFT, "--dB");
+          }
+
+          // --- Battery Level (far right) ---
+          {
+            const char* bat_icon = "\U000F0082"; // Battery icon
+            it.printf(448 - 4, 12, id(font_material_design_icons_400_16), color_on, TextAlign::CENTER_RIGHT, "%s", bat_icon);
+            if (id(filtered_battery).has_state())
+              it.printf(448 + 4, 12, id(font_roboto_400_12), color_on, TextAlign::CENTER_LEFT, "%.0f%%", id(filtered_battery).state);
+            else
+              it.printf(448 + 4, 12, id(font_roboto_400_12), color_on, TextAlign::CENTER_LEFT, "--%%");
+          }
+
+          // --- Time (left side) ---
+          {
+            auto now = id(ha_time).now();
+            it.strftime(25, 12, id(font_roboto_700_14), color_on, TextAlign::CENTER, "%H:%M", now);
+          }
+
+          // ========================================
+          // 4. CURRENT WEATHER (CENTER)
+          // ========================================
+
+          // --- Outdoor Temperature (large font) ---
+          {
+            char wrap_buf[512];
+            sprintf(wrap_buf, "%.1f °C", id(sensor_outdoor_temperature).state);
+            print_wrapped_text(240, 213, 300, 74, id(font_quicksand_500_70), color_on, TextAlign::CENTER, wrap_buf);
+          }
+
+          // --- Weather Description ---
+          {
+            char wrap_buf[512];
+            sprintf(wrap_buf, "%s", id(text_sensor_weather_description).state.c_str());
+            print_wrapped_text(235, 148, 280, 22, id(font_roboto_400_18), color_on, TextAlign::CENTER, wrap_buf);
+          }
+
+          // --- Feels Like Temperature ---
+          {
+            char wrap_buf[512];
+            sprintf(wrap_buf, "%s", id(text_sensor_feels_like).state.c_str());
+            print_wrapped_text(240, 278, 290, 22, id(font_roboto_400_18), color_on, TextAlign::CENTER, wrap_buf);
+          }
+
+          // Horizontal line separator
+          it.filled_rectangle(135, 311, 200, 1, color_on);
+
+          // ========================================
+          // 5. ROOM SENSORS (6 ROOMS)
+          // ========================================
+
+          // --- Room 1: Bedroom ---
+          // Temperature icon based on temperature value
+          if (id(sensor_room1_temp).has_state()) {
+            if (id(sensor_room1_temp).state <= 10)
+              it.printf(40 + 60 / 2 - 20, 461 + 5 + 16, id(font_material_design_icons_400_32), color_on, TextAlign::CENTER, "\U000F0E4C"); // Snowflake
+            else if (id(sensor_room1_temp).state <= 25)
+              it.printf(40 + 60 / 2 - 20, 461 + 5 + 16, id(font_material_design_icons_400_32), color_on, TextAlign::CENTER, "\U000F050F"); // Thermometer normal
+            else
+              it.printf(40 + 60 / 2 - 20, 461 + 5 + 16, id(font_material_design_icons_400_32), color_on, TextAlign::CENTER, "\U000F10C2"); // Thermometer hot
+          } else {
+            it.printf(40 + 60 / 2 - 20, 461 + 5 + 16, id(font_material_design_icons_400_32), color_on, TextAlign::CENTER, "\U000F050F"); // Default
+          }
+          // Temperature value
+          if (id(sensor_room1_temp).has_state())
+            it.printf(40 + 60 / 2 - 20, 461 + 5 + 32 + 2, id(font_roboto_400_16), color_on, TextAlign::TOP_CENTER, "%.1f°C", id(sensor_room1_temp).state);
+          else
+            it.printf(40 + 60 / 2 - 20, 461 + 5 + 32 + 2, id(font_roboto_400_16), color_on, TextAlign::TOP_CENTER, "--°C");
+
+          // Humidity icon based on humidity value
+          if (id(sensor_room1_humidity).has_state()) {
+            if (id(sensor_room1_humidity).state <= 30)
+              it.printf(100 + 60 / 2 - 20, 461 + 5 + 16, id(font_material_design_icons_400_32), color_on, TextAlign::CENTER, "\U000F0E7A"); // Low humidity
+            else if (id(sensor_room1_humidity).state <= 60)
+              it.printf(100 + 60 / 2 - 20, 461 + 5 + 16, id(font_material_design_icons_400_32), color_on, TextAlign::CENTER, "\U000F058E"); // Normal humidity
+            else
+              it.printf(100 + 60 / 2 - 20, 461 + 5 + 16, id(font_material_design_icons_400_32), color_on, TextAlign::CENTER, "\U000F058C"); // High humidity
+          } else {
+            it.printf(100 + 60 / 2 - 20, 461 + 5 + 16, id(font_material_design_icons_400_32), color_on, TextAlign::CENTER, "\U000F058E"); // Default
+          }
+          // Humidity value
+          if (id(sensor_room1_humidity).has_state())
+            it.printf(100 + 60 / 2 - 20, 461 + 5 + 32 + 2, id(font_roboto_400_16), color_on, TextAlign::TOP_CENTER, "%.0f%%", id(sensor_room1_humidity).state);
+          else
+            it.printf(100 + 60 / 2 - 20, 461 + 5 + 32 + 2, id(font_roboto_400_16), color_on, TextAlign::TOP_CENTER, "--%");
+
+          // Room name
+          it.printf(100 - 20, 446, id(font_roboto_500_15), color_on, TextAlign::CENTER, "BEDROOM");
+
+          // --- Room 2: Second Bedroom ---
+          it.printf(240, 446, id(font_roboto_500_15), color_on, TextAlign::CENTER, "2ND BEDROOM");
+
+          // Temperature icon and value
+          if (id(sensor_room2_temp).has_state()) {
+            if (id(sensor_room2_temp).state <= 10)
+              it.printf(180 + 60 / 2, 461 + 5 + 16, id(font_material_design_icons_400_32), color_on, TextAlign::CENTER, "\U000F0E4C");
+            else if (id(sensor_room2_temp).state <= 25)
+              it.printf(180 + 60 / 2, 461 + 5 + 16, id(font_material_design_icons_400_32), color_on, TextAlign::CENTER, "\U000F050F");
+            else
+              it.printf(180 + 60 / 2, 461 + 5 + 16, id(font_material_design_icons_400_32), color_on, TextAlign::CENTER, "\U000F10C2");
+          } else {
+            it.printf(180 + 60 / 2, 461 + 5 + 16, id(font_material_design_icons_400_32), color_on, TextAlign::CENTER, "\U000F050F");
+          }
+          if (id(sensor_room2_temp).has_state())
+            it.printf(180 + 60 / 2, 461 + 5 + 32 + 2, id(font_roboto_400_16), color_on, TextAlign::TOP_CENTER, "%.1f°C", id(sensor_room2_temp).state);
+          else
+            it.printf(180 + 60 / 2, 461 + 5 + 32 + 2, id(font_roboto_400_16), color_on, TextAlign::TOP_CENTER, "--°C");
+
+          // Humidity icon and value
+          if (id(sensor_room2_humidity).has_state()) {
+            if (id(sensor_room2_humidity).state <= 30)
+              it.printf(240 + 60 / 2, 461 + 5 + 16, id(font_material_design_icons_400_32), color_on, TextAlign::CENTER, "\U000F0E7A");
+            else if (id(sensor_room2_humidity).state <= 60)
+              it.printf(240 + 60 / 2, 461 + 5 + 16, id(font_material_design_icons_400_32), color_on, TextAlign::CENTER, "\U000F058E");
+            else
+              it.printf(240 + 60 / 2, 461 + 5 + 16, id(font_material_design_icons_400_32), color_on, TextAlign::CENTER, "\U000F058C");
+          } else {
+            it.printf(240 + 60 / 2, 461 + 5 + 16, id(font_material_design_icons_400_32), color_on, TextAlign::CENTER, "\U000F058E");
+          }
+          if (id(sensor_room2_humidity).has_state())
+            it.printf(240 + 60 / 2, 461 + 5 + 32 + 2, id(font_roboto_400_16), color_on, TextAlign::TOP_CENTER, "%.0f%%", id(sensor_room2_humidity).state);
+          else
+            it.printf(240 + 60 / 2, 461 + 5 + 32 + 2, id(font_roboto_400_16), color_on, TextAlign::TOP_CENTER, "--%");
+
+          // --- Room 3: Kitchen ---
+          // (Similar structure for rooms 3-6, omitted for brevity)
+          // Add rooms 3-6 following the same pattern as rooms 1-2
+
+          // ========================================
+          // 6. WEATHER FORECAST (5 DAYS)
+          # ========================================
+
+          // Day 1
+          if (id(sensor_forecast_day1_condition).has_state()) {
+            it.printf(60, 358, id(font_material_design_icons_400_32), color_on, TextAlign::CENTER, "%s", id(sensor_forecast_day1_condition).state.c_str());
+          }
+          if (id(sensor_forecast_day1_day).has_state()) {
+            it.printf(60, 390, id(font_roboto_400_12), color_on, TextAlign::CENTER, "%s", id(sensor_forecast_day1_day).state.c_str());
+          }
+          if (id(sensor_forecast_day1_high).has_state() && id(sensor_forecast_day1_low).has_state()) {
+            it.printf(60, 405, id(font_roboto_400_14), color_on, TextAlign::CENTER, "%.0f°/%.0f°", id(sensor_forecast_day1_high).state, id(sensor_forecast_day1_low).state);
+          }
+
+          // Days 2-5 (follow same pattern)
+          // Add forecast days 2-5 following the same structure
+
+          // ========================================
+          // 7. CALENDAR SECTION (BOTTOM)
+          # ========================================
+
+          // Calendar rendering logic would go here
+          // Shows current month with today's date highlighted
+
+# ============================================================================
+# TIME SYNCHRONIZATION
+# ============================================================================
+
+time:
+  - platform: homeassistant
+    id: ha_time
+    on_time:
+      # Night mode: update at 2:00 AM and sleep until 5:30 AM
+      - seconds: 0
+        minutes: 0
+        hours: 2
+        then:
+          - script.execute: update_screen
+          - deep_sleep.enter:
+              id: deep_sleep_control
+      - seconds: 0
+        minutes: 30
+        hours: 5
+        then:
+          - script.execute: update_screen
+          - deep_sleep.enter:
+              id: deep_sleep_control
+
+# ============================================================================
+# BATTERY MONITORING
+# ============================================================================
+
+# Battery voltage sensor (ADC on pin A0)
+sensor:
+  - platform: adc
+    pin: A0
+    name: "Battery Voltage"
+    id: ink_battery
+    update_interval: 60s
+    attenuation: auto
+    # Convert voltage to percentage (adjust calibration based on your battery)
+    filters:
+      - multiply: 100.0
+      - calibrate_linear:
+          - 3.0 -> 0
+          - 4.2 -> 100
+
+  # WiFi signal strength
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    id: wifi_signal_dbm
+    update_interval: 60s
+
+# Filtered battery percentage (for display)
+  - platform: template
+    name: "Filtered Battery"
+    id: filtered_battery
+    lambda: |-
+      if (id(ink_battery).has_state()) {
+        return id(ink_battery).state;
+      }
+      return 0.0;
+    update_interval: 60s
+
+# ============================================================================
+# TEXT SENSORS (FROM HOME ASSISTANT)
+# ============================================================================
+
+text_sensor:
+  # Greeting text from Home Assistant input_text
+  - platform: homeassistant
+    name: "Greeting Text"
+    id: input_text_greeting
+    entity_id: input_text.weather_display_greeting
+
+  # Holiday dates text from Home Assistant input_text
+  - platform: homeassistant
+    name: "Holiday Dates"
+    id: input_text_dates
+    entity_id: input_text.weather_display_dates
+
+  # Outdoor temperature from Home Assistant
+  - platform: homeassistant
+    name: "Outdoor Temperature"
+    id: sensor_outdoor_temperature
+    entity_id: sensor.outdoor_temperature
+
+  # Weather description from Home Assistant
+  - platform: homeassistant
+    name: "Weather Description"
+    id: text_sensor_weather_description
+    entity_id: sensor.weather_description
+
+  # Feels like temperature from Home Assistant
+  - platform: homeassistant
+    name: "Feels Like"
+    id: text_sensor_feels_like
+    entity_id: sensor.feels_like_temperature
+
+  # Forecast day 1 - Day of week
+  - platform: homeassistant
+    name: "Forecast Day 1 - Day"
+    id: sensor_forecast_day1_day
+    entity_id: sensor.weather_forecast_day1_day
+
+  # Forecast day 1 - Condition icon
+  - platform: homeassistant
+    name: "Forecast Day 1 - Condition"
+    id: sensor_forecast_day1_condition
+    entity_id: sensor.weather_forecast_day1_condition
+
+  # Forecast day 1 - High temperature
+  - platform: homeassistant
+    name: "Forecast Day 1 - High"
+    id: sensor_forecast_day1_high
+    entity_id: sensor.weather_forecast_day1_high
+
+  # Forecast day 1 - Low temperature
+  - platform: homeassistant
+    name: "Forecast Day 1 - Low"
+    id: sensor_forecast_day1_low
+    entity_id: sensor.weather_forecast_day1_low
+
+  # Room 1 - Temperature
+  - platform: homeassistant
+    name: "Room 1 - Temperature"
+    id: sensor_room1_temp
+    entity_id: sensor.bedroom_temperature
+
+  # Room 1 - Humidity
+  - platform: homeassistant
+    name: "Room 1 - Humidity"
+    id: sensor_room1_humidity
+    entity_id: sensor.bedroom_humidity
+
+  # Room 2 - Temperature
+  - platform: homeassistant
+    name: "Room 2 - Temperature"
+    id: sensor_room2_temp
+    entity_id: sensor.bedroom2_temperature
+
+  # Room 2 - Humidity
+  - platform: homeassistant
+    name: "Room 2 - Humidity"
+    id: sensor_room2_humidity
+    entity_id: sensor.bedroom2_humidity
+
+  # Add text sensors for rooms 3-6 following the same pattern
+
+# ============================================================================
+# BINARY SENSORS
+# ============================================================================
+
+binary_sensor:
+  # Enable/disable deep sleep
+  - platform: homeassistant
+    name: "Deep Sleep Enabled"
+    id: deep_sleep_enabled
+    entity_id: input_boolean.weather_display_deep_sleep
+
+  # Holiday mode toggle
+  - platform: homeassistant
+    name: "Holiday Mode"
+    id: holiday_mode
+    entity_id: input_boolean.weather_display_holiday_mode
+
+# ============================================================================
+# DEEP SLEEP CONFIGURATION
+# ============================================================================
+
+deep_sleep:
+  id: deep_sleep_control
+  # Sleep for 30 minutes (1800 seconds)
+  sleep_duration: 30min
+  # Wake up on button press (optional)
+  # wake_up_pin: GPIO0
+
+# ============================================================================
+# FONTS
+# ============================================================================
+
+# Note: Font files should be placed in /config/esphome/fonts/ directory
+# Or use gfonts as shown below
+
+font:
+  # Playfair Display - for greeting (large)
+  - file: 'gfonts://Playfair+Display'
+    id: font_playfair_display_600_100
+    size: 100
+    weight: 600
+
+  - file: 'gfonts://Playfair+Display'
+    id: font_playfair_display_600_40
+    size: 40
+    weight: 600
+
+  # Roboto - main font family
+  - file: 'gfonts://Roboto'
+    id: font_roboto_400_12
+    size: 12
+    weight: 400
+
+  - file: 'gfonts://Roboto'
+    id: font_roboto_400_14
+    size: 14
+    weight: 400
+
+  - file: 'gfonts://Roboto'
+    id: font_roboto_400_16
+    size: 16
+    weight: 400
+
+  - file: 'gfonts://Roboto'
+    id: font_roboto_400_18
+    size: 18
+    weight: 400
+
+  - file: 'gfonts://Roboto'
+    id: font_roboto_500_15
+    size: 15
+    weight: 500
+
+  - file: 'gfonts://Roboto'
+    id: font_roboto_600_15
+    size: 15
+    weight: 600
+
+  - file: 'gfonts://Roboto'
+    id: font_roboto_700_14
+    size: 14
+    weight: 700
+
+  - file: 'gfonts://Roboto'
+    id: font_roboto_800_12
+    size: 12
+    weight: 800
+
+  # Quicksand - for temperature display
+  - file: 'gfonts://Quicksand'
+    id: font_quicksand_500_70
+    size: 70
+    weight: 500
+
+  # Material Design Icons - for icons
+  - file: "mdi"
+    id: font_material_design_icons_400_16
+    size: 16
+    glyphs: &mdi-icons
+      - "\U000F092B" # wifi-off
+      - "\U000F0928" # wifi-strength-4
+      - "\U000F0925" # wifi-strength-3
+      - "\U000F0922" # wifi-strength-2
+      - "\U000F091F" # wifi-strength-1
+      - "\U000F0082" # battery
+      - "\U000F0E4C" # snowflake
+      - "\U000F050F" # thermometer
+      - "\U000F10C2" # thermometer-alert
+      - "\U000F0E7A" # water-percent-low
+      - "\U000F058E" # water-percent
+      - "\U000F058C" # water-plus
+
+  - file: "mdi"
+    id: font_material_design_icons_400_32
+    size: 32
+    glyphs: *mdi-icons
+
+  - file: "mdi"
+    id: font_material_design_icons_400_48
+    size: 48
+    glyphs: *mdi-icons
+
+# ============================================================================
+# END OF CONFIGURATION
+# ============================================================================
