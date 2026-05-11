@@ -326,15 +326,6 @@ For issues or questions:
    - Configuration (sanitized)
    - Description of the problem
 
-## Roadmap
-
-- [ ] Add touch support for manual refresh
-- [ ] Integrate calendar events
-- [ ] Add sunrise/sunset times
-- [ ] Support for air quality sensors
-- [ ] Custom theme configuration
-- [ ] Web interface for quick configuration
-
 ---
 
 **Enjoy your weather display!** 🌤️
